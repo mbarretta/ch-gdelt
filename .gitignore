@@ -2,5 +2,6 @@
 *.zip
 *.CSV
 *.csv
+!cameo.csv
 __pycache__/
 venv/
