@@ -43,6 +43,13 @@ INGEST_LOG_TABLE = "ingest_log"
 
 DEFAULT_MUTATION_TIMEOUT_S = 120
 DEFAULT_MUTATION_POLL_INTERVAL_S = 1.0
+# main() processes every unresolved timestamp sequentially in one invocation,
+# and each timestamp can block up to DEFAULT_MUTATION_TIMEOUT_S * 2 (two
+# deletes) before its inserts even start. The deployed Cloud Run timeout
+# (see README.md's deploy command) is set to the gen2 maximum to absorb
+# this; a backlog large enough to still exceed it is left for the next
+# scheduled invocation to continue -- safe, since the idempotency scheme
+# never double-inserts, just possibly slower to fully catch up.
 
 _KIND_SUFFIXES = {
     "export": ".export.CSV.zip",
@@ -78,12 +85,13 @@ def _to_datetime(value):
 # --------------------------------------------------------------------------
 # Explicit static source-ordinal -> GDELT 2.0 field name mapping.
 #
-# Ordinals and names verified against the sample files in the repo root
-# (20260918143000.export.CSV: 61 tab-delimited columns; the mentions member
-# of 20260918143000.mentions.CSV.zip: 16 columns) cross-referenced with the
-# GDELT 2.0 Event/Mention codebook field layout. "Day" (export ordinal 2) and
-# "DATEADDED"/"EventTimeDate"/"MentionTimeDate" match the naming used in the
-# architecture doc and this task's acceptance criteria.
+# Ordinals and names were verified once during development against local
+# GDELT sample files (a 61-tab-delimited-column export and a 16-column
+# mentions file), cross-referenced with the GDELT 2.0 Event/Mention codebook
+# field layout. Those sample files are gitignored and not part of this repo,
+# so this verification is not reproducible from a fresh clone; "Day" (export
+# ordinal 2) and "DATEADDED"/"EventTimeDate"/"MentionTimeDate" match the
+# naming used in the architecture doc and this task's acceptance criteria.
 # --------------------------------------------------------------------------
 
 EVENTS_COLUMN_SPEC = [
@@ -204,7 +212,7 @@ def get_client():
         host=parsed.hostname,
         port=parsed.port,
         username=os.environ["CLICKHOUSE_USER"],
-        password=os.environ.get("CLICKHOUSE_PASSWORD", ""),
+        password=os.environ["CLICKHOUSE_PASSWORD"],
         secure=parsed.scheme == "https",
     )
 

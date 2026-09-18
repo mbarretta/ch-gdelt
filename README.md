@@ -77,7 +77,7 @@ gcloud functions deploy gdelt-ingest \
   --no-allow-unauthenticated \
   --max-instances=1 \
   --concurrency=1 \
-  --timeout=300s \
+  --timeout=3600s \
   --memory=512Mi \
   --service-account="gdelt-ingest-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
   --set-secrets="CLICKHOUSE_PASSWORD=gdelt-clickhouse-password:latest" \
@@ -85,6 +85,8 @@ gcloud functions deploy gdelt-ingest \
 ```
 
 `--max-instances=1 --concurrency=1` is not a cost/scaling knob here — it is the mechanism that guarantees overlapping invocations can never run at the same time. The delete-then-insert idempotency scheme in `main.py` (task 2 `ac9`) is only safe under a single writer; see the warning in the local dry run section above.
+
+`--timeout=3600s` (the gen2 maximum) is deliberately set high: `main.py` processes every unresolved timestamp sequentially in one invocation, and each timestamp can block for up to `DEFAULT_MUTATION_TIMEOUT_S * 2` (240s) waiting for its two idempotency deletes to confirm, before its inserts even start. A short outage produces one or two candidates and finishes in well under a minute; an outage or scheduler gap long enough to accumulate many unresolved timestamps in one run could still exceed even the 3600s ceiling, in which case the invocation is killed mid-catch-up. That is safe — the idempotent design means a killed invocation just leaves the remaining timestamps unresolved for the next scheduled run to pick up — but it does mean catch-up after a long outage may take several consecutive invocations rather than one.
 
 Grant the scheduler SA permission to invoke the now-existing function:
 
