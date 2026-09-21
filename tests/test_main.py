@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import io
 import zipfile
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 import requests
@@ -18,7 +18,7 @@ BOUNDARY = main.GDELT_BOUNDARY
 
 
 def _ts(s):
-    return datetime.strptime(s, "%Y%m%d%H%M%S")
+    return datetime.strptime(s, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +245,9 @@ def test_to_date_empty_is_none():
 
 
 def test_to_datetime_parses_yyyymmddhhmmss():
-    assert main._to_datetime("20260918143000") == datetime(2026, 9, 18, 14, 30, 0)
+    result = main._to_datetime("20260918143000")
+    assert result == datetime(2026, 9, 18, 14, 30, 0, tzinfo=timezone.utc)
+    assert result.tzinfo is not None
 
 
 def test_to_datetime_empty_is_none():
@@ -256,14 +258,37 @@ def test_transform_row_converts_named_export_date_fields():
     raw = _export_row(_ts("20260918143000"))
     result = main.transform_row(raw, main.EVENTS_COLUMN_SPEC)
     assert result["Day"] is None  # blank in our fixture row
-    assert result["DATEADDED"] == datetime(2026, 9, 18, 14, 30, 0)
+    assert result["DATEADDED"] == datetime(2026, 9, 18, 14, 30, 0, tzinfo=timezone.utc)
+    assert result["DATEADDED"].tzinfo is not None
 
 
 def test_transform_row_converts_named_mentions_date_fields():
     raw = _mentions_row(_ts("20260918143000"))
     result = main.transform_row(raw, main.MENTIONS_COLUMN_SPEC)
-    assert result["MentionTimeDate"] == datetime(2026, 9, 18, 14, 30, 0)
+    assert result["MentionTimeDate"] == datetime(2026, 9, 18, 14, 30, 0, tzinfo=timezone.utc)
+    assert result["MentionTimeDate"].tzinfo is not None
     assert result["EventTimeDate"] is None  # blank in our fixture row
+
+
+# ---------------------------------------------------------------------------
+# ac1/ac3: get_client() pins a UTC session timezone as defense in depth
+# ---------------------------------------------------------------------------
+
+def test_get_client_pins_utc_session_timezone(monkeypatch):
+    captured = {}
+
+    def fake_get_client(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(main.clickhouse_connect, "get_client", fake_get_client)
+    monkeypatch.setenv("CLICKHOUSE_URL", "https://example.com:8443")
+    monkeypatch.setenv("CLICKHOUSE_USER", "default")
+    monkeypatch.setenv("CLICKHOUSE_PASSWORD", "secret")
+
+    main.get_client()
+
+    assert captured["settings"] == {"session_timezone": "UTC"}
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +311,55 @@ def test_candidate_timestamps_multi_gap_in_order():
     latest = t0 + 3 * BOUNDARY
     expected = [t0 + BOUNDARY, t0 + 2 * BOUNDARY, t0 + 3 * BOUNDARY]
     assert main.candidate_timestamps(t0, latest) == expected
+
+
+# ---------------------------------------------------------------------------
+# ac1: every GDELT-derived timestamp is UTC-aware end to end, never naive --
+# a naive value gets silently shifted by clickhouse_connect's local-timezone
+# interpretation on a non-UTC host (see _as_utc's docstring).
+# ---------------------------------------------------------------------------
+
+def test_to_datetime_is_utc_aware():
+    assert main._to_datetime("20260918143000").tzinfo == timezone.utc
+
+
+def test_fetch_lastupdate_latest_is_utc_aware():
+    ts = _ts("20260918144500")
+    session = FakeSession()
+    _set_latest(session, ts)
+
+    _files, latest = main.fetch_lastupdate(session=session)
+
+    assert latest.tzinfo == timezone.utc
+
+
+def test_candidate_timestamps_output_is_utc_aware():
+    t0 = _ts("20260918143000")
+    latest = t0 + BOUNDARY
+    for ts in main.candidate_timestamps(t0, latest):
+        assert ts.tzinfo == timezone.utc
+
+
+# ---------------------------------------------------------------------------
+# ac2: _ingest_log_state normalizes ClickHouse reads to UTC-aware, even when
+# the client (its default tz_mode) hands back naive datetimes -- so
+# candidate_timestamps/_candidates_to_process never compares naive against
+# aware.
+# ---------------------------------------------------------------------------
+
+def test_ingest_log_state_normalizes_naive_reads_to_utc_aware():
+    naive_ts = datetime(2026, 9, 18, 14, 30, 0)  # simulates a naive-utc read
+    client = StubClickHouseClient(ingest_log_rows=[(naive_ts, "success", 1, 1, "")])
+
+    earliest, success_timestamps = main._ingest_log_state(client)
+
+    assert earliest.tzinfo == timezone.utc
+    assert earliest == naive_ts.replace(tzinfo=timezone.utc)
+    assert all(ts.tzinfo == timezone.utc for ts in success_timestamps)
+
+    latest = _ts("20260918150000")  # aware; must compare cleanly against `earliest`
+    candidates = main._candidates_to_process(earliest, success_timestamps, latest)
+    assert all(ts.tzinfo == timezone.utc for ts in candidates)
 
 
 # ---------------------------------------------------------------------------

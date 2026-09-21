@@ -18,7 +18,7 @@ import os
 import re
 import time
 import zipfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 import clickhouse_connect
@@ -79,7 +79,26 @@ def _to_date(value):
 
 
 def _to_datetime(value):
-    return datetime.strptime(value, "%Y%m%d%H%M%S") if value else None
+    return _as_utc(datetime.strptime(value, "%Y%m%d%H%M%S")) if value else None
+
+
+def _as_utc(value):
+    """Normalize a datetime that represents a UTC instant to timezone-aware
+    UTC, whether it arrived naive (GDELT string parsing, or a ClickHouse read
+    under the client's default naive_utc tz_mode) or already aware.
+
+    GDELT's 14-digit timestamps and every DateTime column this project reads
+    or writes are always UTC; this makes that explicit so clickhouse_connect
+    never has to guess -- see _write_column_binary in clickhouse_connect's
+    DateTime type, which calls the naive datetime.timestamp() (interpreted
+    against the *local system* timezone) unless the value is already
+    timezone-aware.
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 # --------------------------------------------------------------------------
@@ -214,6 +233,11 @@ def get_client():
         username=os.environ["CLICKHOUSE_USER"],
         password=os.environ["CLICKHOUSE_PASSWORD"],
         secure=parsed.scheme == "https",
+        # Defense in depth: every datetime this module hands to
+        # clickhouse-connect is already timezone-aware UTC (see _as_utc), but
+        # pin the session's own timezone too so a naive value can never be
+        # silently reinterpreted using this process's local system timezone.
+        settings={"session_timezone": "UTC"},
     )
 
 
@@ -324,7 +348,7 @@ def fetch_lastupdate(session=None):
     match = TIMESTAMP_RE.match(files["export"]["url"].rsplit("/", 1)[-1])
     if not match:
         raise RuntimeError("could not derive a 14-digit timestamp from the export URL")
-    latest_timestamp = datetime.strptime(match.group(0), "%Y%m%d%H%M%S")
+    latest_timestamp = _as_utc(datetime.strptime(match.group(0), "%Y%m%d%H%M%S"))
 
     return files, latest_timestamp
 
@@ -493,13 +517,12 @@ def _ingest_log_state(client):
     a log that has rows but no successes yet."""
     row = client.query(f"SELECT count(), min(file_timestamp) FROM {DATABASE}.{INGEST_LOG_TABLE}").result_rows[0]
     total, earliest = row[0], row[1]
-    if total == 0:
-        earliest = None
+    earliest = _as_utc(earliest) if total else None
 
     success_rows = client.query(
         f"SELECT file_timestamp FROM {DATABASE}.{INGEST_LOG_TABLE} WHERE status = 'success'"
     ).result_rows
-    success_timestamps = {r[0] for r in success_rows}
+    success_timestamps = {_as_utc(r[0]) for r in success_rows}
     return earliest, success_timestamps
 
 
