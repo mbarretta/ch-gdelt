@@ -16,7 +16,6 @@ import json
 import logging
 import os
 import re
-import time
 import zipfile
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
@@ -40,16 +39,6 @@ DATABASE = "gdelt"
 EVENTS_TABLE = "events"
 MENTIONS_TABLE = "mentions"
 INGEST_LOG_TABLE = "ingest_log"
-
-DEFAULT_MUTATION_TIMEOUT_S = 120
-DEFAULT_MUTATION_POLL_INTERVAL_S = 1.0
-# main() processes every unresolved timestamp sequentially in one invocation,
-# and each timestamp can block up to DEFAULT_MUTATION_TIMEOUT_S * 2 (two
-# deletes) before its inserts even start. The deployed Cloud Run timeout
-# (see README.md's deploy command) is set to the gen2 maximum to absorb
-# this; a backlog large enough to still exceed it is left for the next
-# scheduled invocation to continue -- safe, since the idempotency scheme
-# never double-inserts, just possibly slower to fully catch up.
 
 _KIND_SUFFIXES = {
     "export": ".export.CSV.zip",
@@ -196,11 +185,6 @@ MENTIONS_COLUMN_SPEC = [
     (16, "Extras", _to_str),
 ]
 
-# Delete key column used for the per-timestamp idempotency delete (ac9).
-EVENTS_DELETE_COLUMN = "DATEADDED"
-MENTIONS_DELETE_COLUMN = "MentionTimeDate"
-
-
 def _assert_complete_spec(column_spec, expected_length):
     ordinals = [ordinal for ordinal, _, _ in column_spec]
     if ordinals != list(range(1, expected_length + 1)):
@@ -254,58 +238,6 @@ def validate_destination_columns(client, table, column_spec):
     if missing:
         raise RuntimeError(f"{table} is missing expected destination column(s): {missing}")
     return actual
-
-
-def _wait_for_mutations(client, database, table, timeout_s, poll_interval_s):
-    """Poll system.mutations until no pending mutation remains for this table.
-
-    Returns True once confirmed complete, False on timeout.
-    """
-    deadline = time.monotonic() + timeout_s
-    while True:
-        result = client.query(
-            "SELECT count() FROM system.mutations "
-            "WHERE database = {database:String} AND table = {table:String} AND is_done = 0",
-            parameters={"database": database, "table": table},
-        )
-        pending = result.result_rows[0][0]
-        if pending == 0:
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(poll_interval_s)
-
-
-def delete_existing_rows(
-    client,
-    database,
-    table,
-    column,
-    timestamp,
-    timeout_s=DEFAULT_MUTATION_TIMEOUT_S,
-    poll_interval_s=DEFAULT_MUTATION_POLL_INTERVAL_S,
-):
-    """Issue ALTER TABLE ... DELETE keyed on this timestamp's own column and
-    block until the mutation is confirmed complete via system.mutations.
-
-    Returns True on confirmed completion; False if the delete failed to
-    submit or timed out waiting for completion -- either case means the
-    caller must abort processing for this timestamp without inserting.
-    """
-    qualified_table = f"{database}.{table}"
-    try:
-        client.command(
-            f"ALTER TABLE {qualified_table} DELETE WHERE {column} = {{ts:DateTime}}",
-            parameters={"ts": timestamp},
-        )
-    except Exception:
-        logger.exception("Failed to submit delete mutation on %s WHERE %s = %s", qualified_table, column, timestamp)
-        return False
-
-    if not _wait_for_mutations(client, database, table, timeout_s, poll_interval_s):
-        logger.error("Timed out waiting for delete mutation on %s WHERE %s = %s", qualified_table, column, timestamp)
-        return False
-    return True
 
 
 # --------------------------------------------------------------------------
@@ -448,6 +380,16 @@ def rows_for_insert(raw_rows, column_spec):
     return names, data
 
 
+def _dedup_token(table, timestamp):
+    """Deterministic insert_deduplication_token for one (table, timestamp)
+    pair. Retrying a timestamp whose insert into this table already landed
+    -- e.g. because a later step in the same attempt failed -- resends this
+    same token, so ClickHouse recognizes the duplicate and skips it instead
+    of writing the rows twice. This is the pipeline's whole idempotency
+    story: no DELETE, no mutation, no wait-for-completion polling."""
+    return f"{table}:{timestamp:%Y%m%d%H%M%S}"
+
+
 # --------------------------------------------------------------------------
 # Per-timestamp orchestration
 # --------------------------------------------------------------------------
@@ -462,7 +404,13 @@ def _write_ingest_log(client, timestamp, status, rows_export, rows_mentions, mes
 
 def process_timestamp(client, timestamp, export_url, mentions_url, session=None):
     """Orchestrate one timestamp end to end: fetch (with masterfilelist
-    fallback), idempotency delete+wait, transform, insert, and log.
+    fallback), transform, insert, and log.
+
+    Idempotency comes entirely from ClickHouse's own insert deduplication
+    (see _dedup_token) -- no DELETE, no mutation, no wait-for-completion
+    polling. Retrying a timestamp whose events insert already landed (e.g.
+    because the mentions insert failed afterward) resends the identical
+    token and ClickHouse skips the duplicate.
 
     Never raises for expected outcomes (missing/error) -- always returns a
     result dict and always writes exactly one gdelt.ingest_log row for a
@@ -483,16 +431,21 @@ def process_timestamp(client, timestamp, export_url, mentions_url, session=None)
         validate_destination_columns(client, f"{DATABASE}.{EVENTS_TABLE}", EVENTS_COLUMN_SPEC)
         validate_destination_columns(client, f"{DATABASE}.{MENTIONS_TABLE}", MENTIONS_COLUMN_SPEC)
 
-        if not delete_existing_rows(client, DATABASE, EVENTS_TABLE, EVENTS_DELETE_COLUMN, timestamp):
-            raise RuntimeError(f"delete against {EVENTS_TABLE} did not complete for {timestamp}")
-        if not delete_existing_rows(client, DATABASE, MENTIONS_TABLE, MENTIONS_DELETE_COLUMN, timestamp):
-            raise RuntimeError(f"delete against {MENTIONS_TABLE} did not complete for {timestamp}")
-
         event_names, event_data = rows_for_insert(export_rows, EVENTS_COLUMN_SPEC)
-        client.insert(f"{DATABASE}.{EVENTS_TABLE}", event_data, column_names=event_names)
+        client.insert(
+            f"{DATABASE}.{EVENTS_TABLE}",
+            event_data,
+            column_names=event_names,
+            settings={"insert_deduplication_token": _dedup_token(EVENTS_TABLE, timestamp)},
+        )
 
         mention_names, mention_data = rows_for_insert(mentions_rows, MENTIONS_COLUMN_SPEC)
-        client.insert(f"{DATABASE}.{MENTIONS_TABLE}", mention_data, column_names=mention_names)
+        client.insert(
+            f"{DATABASE}.{MENTIONS_TABLE}",
+            mention_data,
+            column_names=mention_names,
+            settings={"insert_deduplication_token": _dedup_token(MENTIONS_TABLE, timestamp)},
+        )
     except Exception as exc:
         logger.exception("Failed to process timestamp %s", timestamp)
         _write_ingest_log(client, timestamp, "error", 0, 0, message=str(exc)[:500])

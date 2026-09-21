@@ -24,7 +24,9 @@ curl -X POST http://localhost:8080
 
 Read the JSON response and the function's log output to confirm which timestamps were processed.
 
-**Do not run this dry run against the same ClickHouse destination while the deployed Cloud Run service could also be active.** The per-timestamp idempotency scheme (delete existing rows for a timestamp, wait for the delete to be confirmed complete, then insert) assumes exactly one writer is ever processing at a time. In production that single-writer guarantee comes entirely from the deployment configuration below (`--max-instances=1 --concurrency=1`), not from any locking in the code itself. A local dry run is a second, unsynchronized writer against the same tables — running it concurrently with the live scheduled function can interleave a local delete/insert with a Cloud Run delete/insert and duplicate or drop rows for the same timestamp.
+Idempotency comes from ClickHouse's own insert deduplication, not from anything `main.py` locks or coordinates itself: every insert into `gdelt.events`/`gdelt.mentions` carries an explicit `insert_deduplication_token` keyed on `(table, timestamp)` (see `_dedup_token` in `main.py`). Retrying a timestamp whose events insert already landed — e.g. because the mentions insert failed afterward — resends the identical token, and ClickHouse recognizes and skips the duplicate instead of writing the rows twice. There's no `DELETE`, no mutation, and nothing to poll for completion.
+
+Running this dry run against the same ClickHouse destination while the deployed Cloud Run service is also active is still not recommended as routine practice (redundant work, noisier `gdelt.ingest_log`), but it's no longer a correctness hazard the way a delete-then-insert scheme would be: two writers racing to process the same timestamp just mean one insert lands and the identically-tokened other gets deduped.
 
 ## Deployment runbook
 
@@ -84,9 +86,9 @@ gcloud functions deploy gdelt-ingest \
   --set-env-vars="CLICKHOUSE_URL=https://REPLACE_ME.us-east1.gcp.clickhouse.cloud:8443,CLICKHOUSE_USER=REPLACE_ME"
 ```
 
-`--max-instances=1 --concurrency=1` is not a cost/scaling knob here — it is the mechanism that guarantees overlapping invocations can never run at the same time. The delete-then-insert idempotency scheme in `main.py` (task 2 `ac9`) is only safe under a single writer; see the warning in the local dry run section above.
+`--max-instances=1 --concurrency=1` avoids redundant work (two invocations racing to process the same backlog) rather than guarding correctness — the insert-deduplication-token scheme above (see the local dry run section) is already safe under concurrent writers.
 
-`--timeout=3600s` (the gen2 maximum) is deliberately set high: `main.py` processes every unresolved timestamp sequentially in one invocation, and each timestamp can block for up to `DEFAULT_MUTATION_TIMEOUT_S * 2` (240s) waiting for its two idempotency deletes to confirm, before its inserts even start. A short outage produces one or two candidates and finishes in well under a minute; an outage or scheduler gap long enough to accumulate many unresolved timestamps in one run could still exceed even the 3600s ceiling, in which case the invocation is killed mid-catch-up. That is safe — the idempotent design means a killed invocation just leaves the remaining timestamps unresolved for the next scheduled run to pick up — but it does mean catch-up after a long outage may take several consecutive invocations rather than one.
+`--timeout=3600s` (the gen2 maximum) is deliberately set high: `main.py` processes every unresolved timestamp sequentially in one invocation, and each timestamp's own latency is now just its GDELT fetch plus its two inserts (no mutation-wait). A short outage produces one or two candidates and finishes in well under a minute; an outage or scheduler gap long enough to accumulate many unresolved timestamps in one run could still exceed even the 3600s ceiling, in which case the invocation is killed mid-catch-up. That is safe — the idempotent design means a killed invocation just leaves the remaining timestamps unresolved for the next scheduled run to pick up — but it does mean catch-up after a long outage may take several consecutive invocations rather than one.
 
 Grant the scheduler SA permission to invoke the now-existing function:
 
@@ -98,17 +100,33 @@ gcloud functions add-invoker-policy-binding gdelt-ingest \
   --member="serviceAccount:gdelt-scheduler-sa@${PROJECT_ID}.iam.gserviceaccount.com"
 ```
 
-### 4. Apply schema.sql once by hand
+### 4. Apply bootstrap.sql once by hand, then alters.sql as it grows
 
-`gdelt.ingest_log` is the only table this project creates (`gdelt.events` / `gdelt.mentions` already exist and must never be created, altered, or dropped by this project). Apply it once, by hand, against the target ClickHouse Cloud instance — for example with the `clickhouse-client` CLI or the ClickHouse Cloud SQL console:
+Schema management here is two-phase. `bootstrap.sql` creates every object this project owns (`gdelt.ingest_log`, `event_count_by_actor`, its materialized view, the `cameo_dict` dictionary, the `dict_reader` user) with `IF NOT EXISTS` guards, so it is safe to re-run. `alters.sql` is an append-only log of later, non-destructive schema changes to those same objects — add new entries at its bottom over time rather than editing `bootstrap.sql`.
+
+Both files contain a `${DICT_READER_PASSWORD}` placeholder for the `dict_reader` user instead of a literal password, so they must be substituted at apply time rather than passed directly as `--queries-file`. Use `envsubst` (from `gettext`; `brew install gettext` on macOS) to expand the placeholder and pipe the result into `clickhouse-client` on stdin:
 
 ```bash
-clickhouse-client \
-  --host REPLACE_ME.us-east1.gcp.clickhouse.cloud \
-  --secure --port 9440 \
-  --user REPLACE_ME --password \
-  --queries-file schema.sql
+DICT_READER_PASSWORD='REPLACE_WITH_REAL_PASSWORD' \
+  envsubst < bootstrap.sql | \
+  clickhouse-client \
+    --host REPLACE_ME.us-east1.gcp.clickhouse.cloud \
+    --secure --port 9440 \
+    --user REPLACE_ME --password
 ```
+
+Whenever a new entry is appended to `alters.sql`, apply it the same way, once, by hand:
+
+```bash
+DICT_READER_PASSWORD='REPLACE_WITH_REAL_PASSWORD' \
+  envsubst < alters.sql | \
+  clickhouse-client \
+    --host REPLACE_ME.us-east1.gcp.clickhouse.cloud \
+    --secure --port 9440 \
+    --user REPLACE_ME --password
+```
+
+Never commit a real value for `DICT_READER_PASSWORD` — set it only in the shell environment for these commands.
 
 ### 5. Create the Cloud Scheduler job
 

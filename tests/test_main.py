@@ -91,8 +91,8 @@ class FakeSession:
 
 
 class StubClickHouseClient:
-    """Stands in for clickhouse_connect's client: only .query/.command/.insert
-    are used anywhere in main.py."""
+    """Stands in for clickhouse_connect's client: only .query/.insert are
+    used anywhere in main.py."""
 
     def __init__(self, ingest_log_rows=None):
         # each row: (file_timestamp, status, rows_export, rows_mentions, message)
@@ -101,8 +101,6 @@ class StubClickHouseClient:
         self.mentions_inserts = []
         self.call_log = []
 
-        self.fail_delete_submit_for = set()  # {"events", "mentions"}
-        self.mutation_poll_counts = {}  # table -> polls remaining before is_done
         self.fail_insert_once_for = set()  # {"events", "mentions"}
 
     def _table_kind(self, table):
@@ -121,15 +119,6 @@ class StubClickHouseClient:
             spec = main.EVENTS_COLUMN_SPEC if kind == "events" else main.MENTIONS_COLUMN_SPEC
             return Result([[name, "String"] for name in main.expected_column_names(spec)])
 
-        if "system.mutations" in sql:
-            table = parameters["table"]
-            remaining = self.mutation_poll_counts.get(table, 0)
-            pending = 1 if remaining > 0 else 0
-            if remaining > 0:
-                self.mutation_poll_counts[table] = remaining - 1
-            self.call_log.append(f"poll:{table}:{pending}")
-            return Result([[pending]])
-
         if "count(), min(file_timestamp)" in sql:
             total = len(self.ingest_log_rows)
             earliest = min((r[0] for r in self.ingest_log_rows), default=None) if total else None
@@ -141,15 +130,7 @@ class StubClickHouseClient:
 
         raise AssertionError(f"unexpected query: {sql}")
 
-    def command(self, sql, parameters=None):
-        # sql looks like: "ALTER TABLE gdelt.events DELETE WHERE ..."
-        table = sql.split("ALTER TABLE", 1)[1].split("DELETE", 1)[0].strip()
-        table_kind = self._table_kind(table)
-        if table_kind in self.fail_delete_submit_for:
-            raise RuntimeError(f"simulated failure submitting delete against {table_kind}")
-        self.call_log.append(f"delete_submit:{table_kind}")
-
-    def insert(self, table, data, column_names):
+    def insert(self, table, data, column_names, settings=None):
         kind = self._table_kind(table)
         if kind == "ingest_log":
             for row in data:
@@ -162,7 +143,7 @@ class StubClickHouseClient:
             raise RuntimeError(f"simulated failure inserting into {kind}")
 
         target = self.events_inserts if kind == "events" else self.mentions_inserts
-        target.append((list(column_names), [list(row) for row in data]))
+        target.append((list(column_names), [list(row) for row in data], settings))
         self.call_log.append(f"insert:{kind}")
 
 
@@ -439,111 +420,64 @@ def test_masterfilelist_miss_returns_none():
 
 
 # ---------------------------------------------------------------------------
-# ac4: idempotency delete waits for confirmed completion
+# Idempotency via ClickHouse insert_deduplication_token (no deletes,
+# mutations, or wait-for-completion polling -- see main.py's _dedup_token).
 # ---------------------------------------------------------------------------
 
-def test_delete_existing_rows_waits_for_multiple_polls_then_succeeds():
-    client = StubClickHouseClient()
-    client.mutation_poll_counts["events"] = 2  # pending, pending, then done
-
-    ok = main.delete_existing_rows(
-        client, "gdelt", "events", "DATEADDED", _ts("20260918143000"),
-        timeout_s=5, poll_interval_s=0,
-    )
-
-    assert ok is True
-    assert client.call_log == ["delete_submit:events", "poll:events:1", "poll:events:1", "poll:events:0"]
+def test_dedup_token_is_deterministic_per_table_and_timestamp():
+    ts = _ts("20260918143000")
+    assert main._dedup_token("events", ts) == main._dedup_token("events", ts)
 
 
-def test_delete_existing_rows_times_out_returns_false():
-    client = StubClickHouseClient()
-    client.mutation_poll_counts["events"] = 10_000  # never reaches is_done in time
-
-    ok = main.delete_existing_rows(
-        client, "gdelt", "events", "DATEADDED", _ts("20260918143000"),
-        timeout_s=0.05, poll_interval_s=0.01,
-    )
-
-    assert ok is False
+def test_dedup_token_differs_by_table():
+    ts = _ts("20260918143000")
+    assert main._dedup_token("events", ts) != main._dedup_token("mentions", ts)
 
 
-def test_delete_existing_rows_returns_false_when_submit_fails():
-    client = StubClickHouseClient()
-    client.fail_delete_submit_for.add("events")
-
-    ok = main.delete_existing_rows(
-        client, "gdelt", "events", "DATEADDED", _ts("20260918143000"),
-        timeout_s=5, poll_interval_s=0,
-    )
-
-    assert ok is False
-    assert client.call_log == []  # never got past the failed submit
+def test_dedup_token_differs_by_timestamp():
+    ts = _ts("20260918143000")
+    assert main._dedup_token("events", ts) != main._dedup_token("events", ts + BOUNDARY)
 
 
-# ---------------------------------------------------------------------------
-# ac4: process_timestamp delete-then-insert ordering and failure handling
-# ---------------------------------------------------------------------------
-
-def test_process_timestamp_waits_for_both_deletes_before_either_insert():
+def test_process_timestamp_tags_each_insert_with_its_dedup_token():
     ts = _ts("20260918143000")
     session = FakeSession()
     _register_timestamp(session, ts)
     client = StubClickHouseClient()
-    client.mutation_poll_counts["events"] = 1
-    client.mutation_poll_counts["mentions"] = 1
 
     result = main.process_timestamp(client, ts, _export_url(ts), _mentions_url(ts), session=session)
 
     assert result["status"] == "success"
-    last_mentions_done = max(i for i, c in enumerate(client.call_log) if c == "poll:mentions:0")
-    first_insert = min(i for i, c in enumerate(client.call_log) if c.startswith("insert:"))
-    assert last_mentions_done < first_insert
+    _names, _data, events_settings = client.events_inserts[0]
+    _names, _data, mentions_settings = client.mentions_inserts[0]
+    assert events_settings == {"insert_deduplication_token": main._dedup_token("events", ts)}
+    assert mentions_settings == {"insert_deduplication_token": main._dedup_token("mentions", ts)}
 
 
-def test_process_timestamp_aborts_without_insert_when_delete_fails():
+def test_process_timestamp_retry_reuses_the_same_dedup_token():
+    # The actual safety property: a retry of the same timestamp -- e.g.
+    # after the mentions insert failed the first time -- must resend the
+    # identical token, since that's what lets ClickHouse's own insert
+    # deduplication recognize and skip a row set it already wrote.
     ts = _ts("20260918143000")
     session = FakeSession()
     _register_timestamp(session, ts)
     client = StubClickHouseClient()
-    client.fail_delete_submit_for.add("events")
+    client.fail_insert_once_for.add("mentions")
 
-    result = main.process_timestamp(client, ts, _export_url(ts), _mentions_url(ts), session=session)
+    first = main.process_timestamp(client, ts, _export_url(ts), _mentions_url(ts), session=session)
+    assert first["status"] == "error"
 
-    assert result["status"] == "error"
-    assert client.events_inserts == []
-    assert client.mentions_inserts == []
-    assert [r for r in client.ingest_log_rows if r[1] == "success"] == []
-    assert client.ingest_log_rows[0][1] == "error"
+    second = main.process_timestamp(client, ts, _export_url(ts), _mentions_url(ts), session=session)
+    assert second["status"] == "success"
+
+    events_tokens = {settings["insert_deduplication_token"] for _n, _d, settings in client.events_inserts}
+    assert events_tokens == {main._dedup_token("events", ts)}
 
 
-def test_process_timestamp_aborts_without_insert_when_delete_times_out(monkeypatch):
-    # Same abort contract as a failed submit, but reached via the timeout
-    # path inside delete_existing_rows -- exercised through process_timestamp
-    # itself, not just the lower-level helper. process_timestamp calls
-    # delete_existing_rows with its real (120s/1.0s) defaults, so wrap it
-    # with tiny timeout/poll-interval values instead of waiting them out.
-    real_delete_existing_rows = main.delete_existing_rows
-
-    def fast_delete_existing_rows(client, database, table, column, timestamp, **_ignored):
-        return real_delete_existing_rows(
-            client, database, table, column, timestamp, timeout_s=0.02, poll_interval_s=0.005,
-        )
-
-    monkeypatch.setattr(main, "delete_existing_rows", fast_delete_existing_rows)
-
-    ts = _ts("20260918143000")
-    session = FakeSession()
-    _register_timestamp(session, ts)
-    client = StubClickHouseClient()
-    client.mutation_poll_counts["events"] = 10_000  # never reports is_done in time
-
-    result = main.process_timestamp(client, ts, _export_url(ts), _mentions_url(ts), session=session)
-
-    assert result["status"] == "error"
-    assert client.events_inserts == []
-    assert client.mentions_inserts == []
-    assert [r for r in client.ingest_log_rows if r[1] == "success"] == []
-
+# ---------------------------------------------------------------------------
+# ac4: process_timestamp failure handling
+# ---------------------------------------------------------------------------
 
 def test_process_timestamp_failure_between_inserts_leaves_no_success_row():
     ts = _ts("20260918143000")

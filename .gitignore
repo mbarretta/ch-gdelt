@@ -5,3 +5,6 @@
 !cameo.csv
 __pycache__/
 venv/
+.claude/*
+!.claude/plans/
+!.claude/plans/**

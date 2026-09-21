@@ -1,0 +1,38 @@
+{
+  "plans": [
+    {
+      "slug": "fix-gdelt-datetime-utc",
+      "title": "Make all GDELT ingest timestamps explicitly UTC-aware",
+      "status": "complete",
+      "mode": "dev",
+      "parallelism": "off",
+      "autonomy": "interactive",
+      "tasks_total": 1,
+      "tasks_complete": 1,
+      "wave_state": "idle",
+      "current_wave": null,
+      "wave_tasks_in_flight": [],
+      "paused_reason": "",
+      "deferred_open": 0,
+      "updated": "2026-09-21T15:36:12-04:00",
+      "path": "/Users/michael.barretta/workspace/github/mbarretta/ch-gdelt/.claude/plans/fix-gdelt-datetime-utc.json"
+    },
+    {
+      "slug": "feat-gdelt-ingest-function",
+      "title": "GDELT-to-ClickHouse Cloud Run ingest function",
+      "status": "complete",
+      "mode": "dev",
+      "parallelism": "auto",
+      "autonomy": "managed",
+      "tasks_total": 4,
+      "tasks_complete": 4,
+      "wave_state": "idle",
+      "current_wave": null,
+      "wave_tasks_in_flight": [],
+      "paused_reason": "",
+      "deferred_open": 0,
+      "updated": "2026-09-18T16:00:18-04:00",
+      "path": "/Users/michael.barretta/workspace/github/mbarretta/ch-gdelt/.claude/plans/feat-gdelt-ingest-function.json"
+    }
+  ]
+}
