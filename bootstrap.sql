@@ -70,8 +70,8 @@ CREATE TABLE IF NOT EXISTS gdelt.events (
     `DATEADDED` DateTime,
     `SOURCEURL` String
 )
-PARTITION BY MonthYear
-ORDER BY (GLOBALEVENTID, DATEADDED);
+PARTITION BY toYYYYMM(DATEADDED)
+ORDER BY (toYYYYMMDD(DATEADDED));
 
 CREATE TABLE IF NOT EXISTS gdelt.mentions (
     `GLOBALEVENTID` UInt32,
@@ -92,7 +92,7 @@ CREATE TABLE IF NOT EXISTS gdelt.mentions (
     `Extras` String
 )
 PARTITION BY toYYYYMM(EventTimeDate)
-ORDER BY (GLOBALEVENTID, EventTimeDate);
+ORDER BY (toYYYYMMDD(EventTimeDate));
 
 -- Ingest-state/audit table for the GDELT ingest Cloud Run function.
 CREATE TABLE IF NOT EXISTS gdelt.ingest_log
@@ -107,21 +107,22 @@ CREATE TABLE IF NOT EXISTS gdelt.ingest_log
 ENGINE = MergeTree
 ORDER BY file_timestamp;
 
-CREATE TABLE IF NOT EXISTS gdelt.event_count_by_actor
-(
-    `LastEventTimeDate` DateTime,
+CREATE TABLE IF NOT EXISTS gdelt.event_count_by_actor (
+    `Day` Date,
     `ActorName` String,
-    `Count` UInt32
+    `Count` UInt32,
 )
-ORDER BY (ActorName, LastEventTimeDate);
+ENGINE = SummingMergeTree
+ORDER BY (Day, ActorName);
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS gdelt.event_count_by_actor_mv TO gdelt.event_count_by_actor
     AS SELECT
-        DATEADDED as LastEventTimeDate,
+        Day,
         arrayJoin([Actor1Name, Actor2Name]) as ActorName,
         count() AS Count
     FROM gdelt.events
-    GROUP BY ActorName, LastEventTimeDate;
+    WHERE ActorName <> ''
+    GROUP BY Day, ActorName;
 
 -- ${DICT_READER_PASSWORD} is substituted at apply time (see README) so the
 -- real password never lives in this file.
@@ -135,7 +136,7 @@ CREATE DICTIONARY IF NOT EXISTS gdelt.cameo_dict
 )
 PRIMARY KEY code
 SOURCE(
-    CLICKHOUSE(TABLE 'gdelt.cameo' USER 'dict_reader' PASSWORD '${DICT_READER_PASSWORD}')
+    CLICKHOUSE(DB 'gdelt' TABLE 'cameo' USER 'dict_reader' PASSWORD '${DICT_READER_PASSWORD}')
 )
 LAYOUT(FLAT())
 LIFETIME(MIN 0 MAX 0);
