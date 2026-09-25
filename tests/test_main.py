@@ -77,13 +77,19 @@ class FakeSession:
 
     def __init__(self):
         self.responses = {}
+        self.raises = {}
         self.calls = []
 
     def set_response(self, url, response):
         self.responses[url] = response
 
+    def set_raises(self, url, exc):
+        self.raises[url] = exc
+
     def get(self, url, timeout=None, stream=False):
         self.calls.append({"url": url, "timeout": timeout, "stream": stream})
+        if url in self.raises:
+            raise self.raises[url]
         return self.responses.get(url, FakeResponse(status_code=404))
 
     def urls_called(self):
@@ -233,6 +239,41 @@ def test_to_datetime_parses_yyyymmddhhmmss():
 
 def test_to_datetime_empty_is_none():
     assert main._to_datetime("") is None
+
+
+def test_to_goldstein_parses_float():
+    assert main._to_goldstein("-3.4") == -3.4
+
+
+def test_to_goldstein_blank_is_zero_not_none():
+    """Regression: a blank GoldsteinScale must not become None -- the
+    destination column is a non-nullable Decimal32(1), and clickhouse-connect's
+    Decimal writer raises decimal.InvalidOperation on Decimal(str(None))."""
+    assert main._to_goldstein("") == 0.0
+
+
+def test_to_goldstein_garbled_value_is_zero_not_a_crash():
+    """Regression: a garbled non-numeric GoldsteinScale (e.g. the literal
+    "42#.5" observed verbatim in real GDELT export files) must degrade to
+    the same 0.0 fallback as a blank field, not raise ValueError."""
+    assert main._to_goldstein("42#.5") == 0.0
+
+
+def test_to_float_parses_value():
+    assert main._to_float("-3.4") == -3.4
+
+
+def test_to_float_blank_is_none():
+    assert main._to_float("") is None
+
+
+def test_to_float_garbled_value_is_none_not_a_crash():
+    """Regression: real GDELT export files have been observed to contain the
+    literal non-numeric string "42#.5" in a float column (e.g. Actor2Geo_Long)
+    across multiple unrelated files -- a recurring upstream data artifact,
+    not a one-off. It must degrade to None like a blank field, not raise
+    ValueError and fail the whole file's insert over one row's one field."""
+    assert main._to_float("42#.5") is None
 
 
 def test_transform_row_converts_named_export_date_fields():
@@ -494,6 +535,24 @@ def test_process_timestamp_failure_between_inserts_leaves_no_success_row():
     statuses = [r[1] for r in client.ingest_log_rows]
     assert "success" not in statuses
     assert statuses == ["error"]  # eligible for a clean retry
+
+
+def test_process_timestamp_network_error_during_fetch_is_caught_not_raised():
+    """Regression: a transient network failure while downloading the export
+    or mentions zip (e.g. a connection reset) must be treated the same as
+    any other per-timestamp failure -- logged as 'error' and returned, not
+    left to propagate and abort every remaining timestamp in the caller's
+    batch."""
+    ts = _ts("20260918143000")
+    session = FakeSession()
+    session.set_raises(_export_url(ts), requests.exceptions.ConnectionError("connection reset by peer"))
+    client = StubClickHouseClient()
+
+    result = main.process_timestamp(client, ts, _export_url(ts), _mentions_url(ts), session=session)
+
+    assert result["status"] == "error"
+    statuses = [r[1] for r in client.ingest_log_rows]
+    assert statuses == ["error"]  # eligible for a clean retry, same as any other failure
 
 
 # ---------------------------------------------------------------------------

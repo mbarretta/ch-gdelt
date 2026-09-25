@@ -4,9 +4,6 @@ Polls GDELT's ``lastupdate.txt`` (published on a 15-minute cadence), computes
 every 15-minute-boundary timestamp that has not yet been successfully
 processed, and loads the ``export`` and ``mentions`` streams for each into an
 existing ClickHouse Cloud ``gdelt`` database. GKG is explicitly out of scope.
-
-See ``.claude/plans/ok-i-want-a-nifty-waffle.md`` for the full design
-rationale (publish cadence, gap-detection strategy, idempotency scheme).
 """
 
 from __future__ import annotations
@@ -56,11 +53,34 @@ def _to_int(value):
 
 
 def _to_float(value):
-    return float(value) if value not in (None, "") else None
+    """A small fraction of real GDELT export rows carry a garbled, non-numeric
+    literal in a float field -- e.g. Actor/ActionGeo_Long has been observed
+    to contain the literal string "42#.5" verbatim in multiple unrelated
+    files months apart, so this is a recurring upstream data artifact, not a
+    one-off. Treat it the same as a blank field (None) rather than raising
+    and failing the whole file's insert over one bad row's one field."""
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
 
 
 def _to_str(value):
     return value if value is not None else ""
+
+
+def _to_goldstein(value):
+    """GoldsteinScale is blank (or, rarely, a garbled non-numeric literal --
+    see _to_float) in a small fraction of real GDELT export rows even though
+    the destination column is a non-nullable Decimal32(1); unlike a Nullable
+    float column, this one must not become None, or clickhouse-connect's
+    Decimal writer calls Decimal(str(None)) == Decimal("None") and raises
+    decimal.InvalidOperation, failing the whole batch insert for every row
+    in that file, not just the offending one."""
+    parsed = _to_float(value)
+    return parsed if parsed is not None else 0.0
 
 
 def _to_date(value):
@@ -133,7 +153,7 @@ EVENTS_COLUMN_SPEC = [
     (28, "EventBaseCode", _to_str),
     (29, "EventRootCode", _to_str),
     (30, "QuadClass", _to_int),
-    (31, "GoldsteinScale", _to_float),
+    (31, "GoldsteinScale", _to_goldstein),
     (32, "NumMentions", _to_int),
     (33, "NumSources", _to_int),
     (34, "NumArticles", _to_int),
@@ -412,22 +432,23 @@ def process_timestamp(client, timestamp, export_url, mentions_url, session=None)
     because the mentions insert failed afterward) resends the identical
     token and ClickHouse skips the duplicate.
 
-    Never raises for expected outcomes (missing/error) -- always returns a
-    result dict and always writes exactly one gdelt.ingest_log row for a
-    processed timestamp, so a bad file never blocks the rest of a catch-up
-    batch in the same invocation.
+    Never raises -- covers fetch (including transient network errors, not
+    just 404s) as well as transform/insert -- and always returns a result
+    dict and writes exactly one gdelt.ingest_log row for a processed
+    timestamp, so one bad or unreachable file never blocks the rest of a
+    catch-up batch in the same invocation.
     """
-    export_rows = _fetch_with_fallback(timestamp, "export", export_url, session=session)
-    if export_rows is None:
-        _write_ingest_log(client, timestamp, "missing", 0, 0, message="export file not found for this timestamp")
-        return {"status": "missing", "timestamp": timestamp}
-
-    mentions_rows = _fetch_with_fallback(timestamp, "mentions", mentions_url, session=session)
-    if mentions_rows is None:
-        _write_ingest_log(client, timestamp, "missing", 0, 0, message="mentions file not found for this timestamp")
-        return {"status": "missing", "timestamp": timestamp}
-
     try:
+        export_rows = _fetch_with_fallback(timestamp, "export", export_url, session=session)
+        if export_rows is None:
+            _write_ingest_log(client, timestamp, "missing", 0, 0, message="export file not found for this timestamp")
+            return {"status": "missing", "timestamp": timestamp}
+
+        mentions_rows = _fetch_with_fallback(timestamp, "mentions", mentions_url, session=session)
+        if mentions_rows is None:
+            _write_ingest_log(client, timestamp, "missing", 0, 0, message="mentions file not found for this timestamp")
+            return {"status": "missing", "timestamp": timestamp}
+
         validate_destination_columns(client, f"{DATABASE}.{EVENTS_TABLE}", EVENTS_COLUMN_SPEC)
         validate_destination_columns(client, f"{DATABASE}.{MENTIONS_TABLE}", MENTIONS_COLUMN_SPEC)
 
